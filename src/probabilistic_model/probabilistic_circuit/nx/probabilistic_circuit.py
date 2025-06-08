@@ -6,6 +6,7 @@ import queue
 import random
 from abc import abstractmethod
 from collections import deque, defaultdict
+from collections.abc import Mapping
 from enum import IntEnum
 
 import networkx as nx
@@ -739,62 +740,540 @@ class ProductUnit(InnerUnit):
                 subcircuit.result_of_current_query.append([start_index, amount])
 
 
-class ProbabilisticCircuit(ProbabilisticModel, nx.DiGraph, SubclassJSONSerializer):
-    """
-    Probabilistic Circuits as a directed, rooted, acyclic graph.
+# --------------------------------------------------------------------------- #
+# rustworkx-powered NetworkX compatibility shim                               #
+# --------------------------------------------------------------------------- #
+import rustworkx as rx
+from collections import deque
+from typing import Dict, Any, Tuple, Iterable
 
-    The nodes of the graph are the units of the circuit.
-    The edges of the graph indicate how the units are connected.
-    The outgoing edges of a sum unit contain the log-log_weights of the subcircuits.
-    """
+class _NodeView:
+    def __init__(self, parent):
+        self._parent = parent            # reference to the graph
 
+    # iterable behaviour --------------------------------------------------- #
+    def __iter__(self):
+        return iter(self._parent._obj2idx.keys())
+
+    def __len__(self):
+        return len(self._parent._obj2idx)
+
+    def __contains__(self, item):
+        return item in self._parent._obj2idx
+
+    # being *callable* lets legacy code do `self.nodes()` ------------------- #
+    # NetworkX’s NodeView ignores most args; we mimic that.
+    def __call__(self, data=False, default=None):
+        if data:
+            # we don’t store per-node attrs; return an empty-dict placeholder
+            return [(n, {}) for n in self]
+        return self
+
+    # convenience: easy conversion to list
+    def to_list(self):
+        return list(self)
+
+    # representation
+    def __repr__(self):
+        return f"<NodeView {list(self)}>"
+
+class _EdgeView:
+    def __init__(self, parent):
+        self._parent = parent   # adapter instance
+
+    # mapping behaviour: G.edges[u, v] -> attr-dict
+    def __getitem__(self, key):
+        u, v = key
+        return self._parent._edge_attr.get((u, v), {})
+
+    # iterable behaviour: for (u,v) in G.edges: …
+    # iterable behaviour – unchanged
+    def __iter__(self):
+        for key in self._parent._edge_attr.keys():   # insertion order
+            yield key                                # (u, v) pairs
+
+    # FIX 1: proper length (edge count, not node count)
+    def __len__(self):
+        return len(self._parent._edge_attr)
+
+    # FIX 2: callable semantics
+    def __call__(self, data=False):
+        """
+        Replicates NetworkX:
+            • G.edges()            → this view (supports len/iter)
+            • G.edges(data=True)   → EdgeDataView (we’ll just give a list)
+        """
+        if data:
+            return list(self._parent._iter_edges(data=True))
+        return self
+
+    def __repr__(self):
+        return f"<EdgeView {list(self)}>"
+
+class _AdjacencyView(Mapping):
+    """
+    NetworkX-style read-only view that lets algorithms do:
+        for nbr in G.adj[u]:
+            ...
+    We ignore edge-attribute look-ups (they’d do G.adj[u][v]) because every
+    algorithm your code calls only iterates over the keys.
+    """
+    def __init__(self, parent):
+        self._p = parent   # adapter instance
+
+    # Mapping interface ---------------------------------------------------- #
+    def __getitem__(self, node):
+        # Return *dict-like* object whose keys are the successors of `node`
+        return {succ: {} for succ in self._p.successors(node)}
+
+    def __iter__(self):
+        return iter(self._p._obj2idx.keys())
+
+    def __len__(self):
+        return len(self._p._obj2idx)
+
+    def __repr__(self):
+        return f"<AdjacencyView of {_RWXDiGraphAdapter.__name__}>"
+
+class _RWXDiGraphAdapter:
+    """
+    Minimal subset of the NetworkX DiGraph API backed by rustworkx.PyDiGraph.
+    Only the operations actually used inside ProbabilisticCircuit are covered;
+    add more if you stumble over a `NotImplementedError`.
+    """
+    # ---------- Construction & bookkeeping --------------------------------- #
+
+    def __init__(self, incoming_graph_data=None, **attr):
+        # NetworkX allowed an optional *incoming_graph_data* argument; we ignore it
+        if hasattr(self, "_g"):            # allow double-initialisation harmlessly
+            return
+        self._g = rx.PyDiGraph()
+        self._obj2idx, self._idx2obj = {}, {}
+        self._edge_attr: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+        self.nodes = _NodeView(self)     # ← replaces the old @property version
+        self.edges = _EdgeView(self)
+        self.adj = _AdjacencyView(self)
+        self._succ_order = defaultdict(list)   # NEW: u -> [v1, v2, ...]
+        self._pred_order = defaultdict(list)   #     optional symmetry
+
+    # ---------- Node helpers ------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Node removal – uses identity checks so caches stay consistent      #
+    # ------------------------------------------------------------------ #
+    def remove_node(self, node):
+        """
+        NetworkX-compatible node deletion that:
+        • updates per-parent successor/precedessor order lists by identity
+        • drops edge attributes
+        • removes the node from the underlying rustworkx graph & caches
+        """
+        idx = self._obj2idx.get(node)
+        if idx is None:
+            return  # already gone
+
+        # ---- 1) prune outgoing edges & successor caches --------------- #
+        for child in list(self._succ_order.pop(node, [])):
+            self._edge_attr.pop((node, child), None)
+            if self._contains_identity(self._pred_order.get(child, []), node):
+                self._remove_identity(self._pred_order[child], node)
+
+        # ---- 2) prune incoming edges & predecessor caches ------------- #
+        for parent in list(self._pred_order.pop(node, [])):
+            self._edge_attr.pop((parent, node), None)
+            if self._contains_identity(self._succ_order.get(parent, []), node):
+                self._remove_identity(self._succ_order[parent], node)
+
+        # ---- 3) drop from rustworkx and mapping caches ---------------- #
+        self._g.remove_node(idx)
+        self._obj2idx.pop(node, None)
+        self._idx2obj.pop(idx,  None)
+
+
+    def remove_nodes_from(self, nodes):
+        for n in nodes:
+            self.remove_node(n)
+
+    # ---------- Edge helpers ------------------------------------------------ #
+    def _edge_key(self, u, v):
+        return (u, v)
+
+    def add_edges_from(self, ebunch: Iterable[Tuple[Any, Any]], **attr):
+        for u, v in ebunch:
+            self.add_edge(u, v, **attr)
+
+    def add_weighted_edges_from(self, ebunch, weight="log_weight", **attr):
+        """
+        Accepts an iterable of (u, v, w) triples and stores `w` under *weight*.
+        """
+        for u, v, w in ebunch:
+            kw = dict(attr)
+            kw[weight] = w
+            self.add_edge(u, v, **kw)
+
+    def remove_edge(self, u, v):
+        idx_u = self._obj2idx[u]
+        idx_v = self._obj2idx[v]
+        self._g.remove_edge(idx_u, idx_v)
+        self._edge_attr.pop(self._edge_key(u, v), None)
+        # keep order lists in sync
+        if self._contains_identity(self._succ_order.get(u, []), v):
+            self._remove_identity(self._succ_order[u], v)
+        if self._contains_identity(self._pred_order.get(v, []), u):
+            self._remove_identity(self._pred_order[v], u)
+    def get_edge_data(self, u, v):
+        return self._edge_attr.get(self._edge_key(u, v), {})
+
+    # ---------- Algorithms -------------------------------------------------- #
+    def bfs_layers(self, root):
+        """
+        Generator of BFS layers (lists of nodes) starting with *root*.
+        """
+        seen = {root}
+        layer = [root]
+        while layer:
+            yield layer
+            nxt = []
+            for n in layer:
+                for succ in self.successors(n):
+                    if succ not in seen:
+                        seen.add(succ)
+                        nxt.append(succ)
+            layer = nxt
+
+    def descendants(self, node):
+        """
+        All strict descendants of *node* (reachables excluding the node itself).
+        """
+        out = set()
+        q = deque([node])
+        while q:
+            cur = q.pop()
+            for succ in self.successors(cur):
+                if succ not in out:
+                    out.add(succ)
+                    q.append(succ)
+        return out
+
+    def is_directed_acyclic_graph(self):
+        return self._g.is_dag()
+
+    def is_weakly_connected(self):
+        undirected = self._g.to_undirected()
+        return len(list(rx.connected_components(undirected))) == 1
+
+    def topological_sort(self):
+        import rustworkx as rx
+
+        if hasattr(rx, "topological_sort"):  # 0.15+
+            for idx in list(rx.topological_sort(self._g)):  # 👈 list() fixes type hint
+                yield self._node_from_idx(idx)
+            return
+
+    def __len__(self):
+        """`len(G)` – number of nodes."""
+        return len(self._obj2idx)
+
+    def __iter__(self):
+        """Iterate over nodes exactly like NetworkX graphs do."""
+        return iter(self._obj2idx.keys())
+
+    def __contains__(self, node):
+        """`node in G` – does this node exist?"""
+        return node in self._obj2idx
+
+    def has_node(self, node):
+        """Alias used by some NX helpers."""
+        return node in self._obj2idx
+
+    def is_directed(self):
+        """NetworkX test for digraph vs. graph."""
+        return True
+
+    def neighbors(self, node):
+        """
+        NetworkX's traversal helpers expect `G.neighbors(v)` to yield
+        *successors* in a digraph, so we just forward to `successors`.
+        """
+        return self.successors(node)
+
+    def subgraph(self, nodes):
+        """
+        Return a new `ProbabilisticCircuit` restricted to *nodes* and all
+        edges whose endpoints are both in that set.
+
+        The *node objects themselves are reused* (same identity), but we
+        rebuild the internal Rustworkx graph, so further structural edits to
+        the subgraph don’t touch the original circuit.
+        """
+        # ----- fast membership test -------------------------------------- #
+        keep = set(nodes)
+
+        # new empty circuit (inherits same class so any overrides survive)
+        sub = self.empty_copy()
+
+        # 1) add nodes
+        sub.add_nodes_from(keep)
+
+        # 2) add edges that stay entirely inside *keep*
+        for u, v, attr in self.edges(data=True):
+            if u in keep and v in keep:
+                if "log_weight" in attr:
+                    sub.add_edge(u, v, log_weight=attr["log_weight"])
+                else:
+                    sub.add_edge(u, v)
+
+        return sub
+
+    def in_degree(self, node):
+        """Return the number of incoming edges for *node*."""
+        return self._g.in_degree(self._obj2idx[node])      # ← fixed name
+
+    def out_degree(self, node):
+        """Return the number of outgoing edges for *node* (just in case)."""
+        return self._g.out_degree(self._obj2idx[node])
+
+    def is_multigraph(self) -> bool:
+        """Mimic networkx.DiGraph.is_multigraph() → always False."""
+        return False
+
+    def _node_from_idx(self, idx):
+        """
+        Accept either an *int index* or an already-materialised node obj.
+        Always return the payload object and refresh the caches.
+        """
+        # Case 1 – idx is already a node object (UnivariateContinuousLeaf, …)
+        if not isinstance(idx, int):
+            obj = idx
+            # If we don’t know its index yet, try to find & cache it
+            if obj not in self._obj2idx:
+                # Slow path: linear scan (rare, only on first encounter)
+                for i, payload in enumerate(self._g):
+                    if payload is obj:      # identity check – fast
+                        self._obj2idx[obj] = i
+                        self._idx2obj[i] = obj
+                        break
+            return obj
+
+        # Case 2 – idx is the numeric node index (normal rustworkx path)
+        obj = self._idx2obj.get(idx)
+        if obj is None:                     # first time we’ve seen this idx
+            obj = self._g[idx]              # pull payload from graph
+            self._idx2obj[idx] = obj
+            self._obj2idx.setdefault(obj, idx)
+        return obj
+
+    # --------------- order-preserving traversal helpers ------------------- #
+    # ------------------------------------------------------------------ #
+    # SUCCESSORS / PREDECESSORS  – now self-healing                      #
+    # ------------------------------------------------------------------ #
+    def successors(self, node):
+        """
+        Yield children in first-seen order **and** guarantee completeness:
+        if an edge (node, c) exists in the Rust graph but c is missing
+        from the cached list (after complex mutate/remove cycles), we
+        append it at the end before yielding.
+        """
+        cache = self._succ_order[node]  # auto-creates empty list
+        # ---------- Sync ------------------------------------------------ #
+        idx = self._obj2idx.get(node)
+        if idx is not None:
+            for c_idx in self._g.successors(idx):
+                child = self._node_from_idx(c_idx)
+                if not self._contains_identity(cache, child):
+                    cache.append(child)  # preserve extra-late order
+        # ---------- Yield ---------------------------------------------- #
+        yield from cache
+
+    def predecessors(self, node):
+        """
+        Same completeness guarantee for parents of *node*.
+        """
+        cache = self._pred_order[node]
+        idx = self._obj2idx.get(node)
+        if idx is not None:
+            for p_idx in self._g.predecessors(idx):
+                parent = self._node_from_idx(p_idx)
+                if not self._contains_identity(cache, parent):
+                    cache.append(parent)
+        yield from cache
+
+
+
+    def _iter_edges(self, data=False):
+        if data:
+            for u_idx, v_idx, w in self._g.weighted_edge_list():
+                u = self._node_from_idx(u_idx)
+                v = self._node_from_idx(v_idx)
+                attr = dict(self._edge_attr.get((u, v), {}))
+                if w is not None:
+                    attr.setdefault("log_weight", w)
+                yield (u, v, attr)
+        else:
+            for u_idx, v_idx in self._g.edge_list():
+                yield (self._node_from_idx(u_idx),
+                       self._node_from_idx(v_idx))
+
+    # convenience wrapper when *internal* code still calls self.edges(data=…)
+    def edges(self, data=False):
+        return list(self._iter_edges(data=data))
+
+    # ------------------------------------------------------------------ #
+    # Directed edge views compatible with NetworkX                       #
+    # ------------------------------------------------------------------ #
+    def in_edges(self, nbunch=None, data=False):
+        """
+        Yield all incoming edges for *nbunch*.
+        *nbunch* may be a single node or an iterable of nodes.
+        Signature matches networkx.DiGraph.in_edges().
+        """
+        # normalise nbunch into an iterable of node objects
+        if nbunch is None:
+            targets = list(self._obj2idx.keys())
+        elif isinstance(nbunch, (list, tuple, set)):
+            targets = nbunch
+        else:  # single node
+            targets = [nbunch]
+
+        for v in targets:
+            for u in self.predecessors(v):
+                if data:
+                    yield (u, v, self._edge_attr.get((u, v), {}))
+                else:
+                    yield (u, v)
+
+    def out_edges(self, nbunch=None, data=False):
+        """
+        Yield all outgoing edges for *nbunch* (optional helper, mirrors NetworkX).
+        """
+        if nbunch is None:
+            sources = list(self._obj2idx.keys())
+        elif isinstance(nbunch, (list, tuple, set)):
+            sources = nbunch
+        else:
+            sources = [nbunch]
+
+        for u in sources:
+            for v in self.successors(u):
+                if data:
+                    yield (u, v, self._edge_attr.get((u, v), {}))
+                else:
+                    yield (u, v)
+
+    # ------------------------------------------------------------------ #
+    # Node helper (now idempotent)                                       #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _contains_identity(lst, obj):
+        """True iff *obj* is identical (is) to an element in *lst*."""
+        return any(o is obj for o in lst)
+
+    @staticmethod
+    def _remove_identity(lst, obj):
+        """Remove the first element that **is** obj (no __eq__)."""
+        for i, o in enumerate(lst):
+            if o is obj:
+                lst.pop(i)
+                break
+
+    def add_node(self, node, **attr):
+        """
+        NetworkX-compatible: if the node already exists just ignore.
+        """
+        if node in self._obj2idx:
+            return self._obj2idx[node]
+
+        idx = self._g.add_node(node)
+        self._obj2idx[node] = idx
+        self._idx2obj[idx]  = node
+        # (store per-node attr here if you ever need them)
+        return idx
+
+    # ------------------------------------------------------------------ #
+    # Robust single-edge semantics                                       #
+    # ------------------------------------------------------------------ #
+    def add_edge(self, u, v, **attr):
+        """
+        • Auto-adds *u* and *v* if missing (NetworkX behaviour)
+        • Keeps at most one edge (u,v); later calls merge/overwrite attrs
+        • If we *think* an edge exists but rustworkx disagrees, we just add it.
+        """
+        # 1) ensure endpoints exist
+        if u not in self._obj2idx:
+            self.add_node(u)
+        if v not in self._obj2idx:
+            self.add_node(v)
+
+        idx_u = self._obj2idx[u]
+        idx_v = self._obj2idx[v]
+        payload = attr.get("log_weight")          # None → unweighted
+        edge_key = (u, v)
+
+        # 2) overwrite vs. brand-new
+        if edge_key in self._edge_attr:
+            # merge/update attribute dict
+            self._edge_attr[edge_key].update(attr)
+            try:
+                # may fail if the edge was removed earlier
+                self._g.update_edge(idx_u, idx_v, payload)
+            except rx.NoEdgeBetweenNodes:
+                self._g.add_edge(idx_u, idx_v, payload)
+        else:
+            self._g.add_edge(idx_u, idx_v, payload)
+            self._edge_attr[edge_key] = dict(attr)
+            # ---------- record insertion order PER PARENT ---------------- #
+            if not self._contains_identity(self._succ_order[u], v):
+                self._succ_order[u].append(v)
+            if not self._contains_identity(self._pred_order[v], u):
+                self._pred_order[v].append(u)
+
+
+# --------------------------------------------------------------------------- #
+# ProbabilisticCircuit – now riding on rustworkx                              #
+# --------------------------------------------------------------------------- #
+from collections import defaultdict, deque as _dq
+import queue, math, numpy as np
+# (import the rest of your project’s classes as before)
+
+class ProbabilisticCircuit(
+    ProbabilisticModel,
+    _RWXDiGraphAdapter,
+    SubclassJSONSerializer
+    ):
+    """
+    Probabilistic Circuits as a directed, rooted, acyclic graph
+    (now backed by rustworkx for speed).
+    """
+    # -------------- construction & cache helpers --------------------------- #
     def __init__(self):
-        super().__init__(None)
-        nx.DiGraph.__init__(self)
+        # keep the original call pattern so nothing downstream changes:
+        super().__init__(None)            # now routes to _RWXDiGraphAdapter.__init__
+        _RWXDiGraphAdapter.__init__(self)
 
+    # cache invalidation stays unchanged …
+    # cache_structure rewritten to use rustworkx' topo order:
     def cache_structure(self):
-        """
-        Call once after building the circuit:
-        - cache nodes
-        - cache edge lists
-        - cache topo order & reverse topo order
-        """
         assert not any(
-            hasattr(self, k) for k in ["_cached_nodes", "_cached_unw", "_cached_w", "_cached_topo", "_cached_rev"]), (
-            "Cache was already set! You should have invalidated it before changing the graph."
-        )
+            hasattr(self, k) for k in
+            ["_cached_nodes", "_cached_unw", "_cached_w",
+             "_cached_topo", "_cached_rev"]
+        ), "Cache was already set! Invalidate it before changing the graph."
 
-        # 1) Nodes
-        self._cached_nodes = list(self.nodes)
+        # 1) nodes
+        self._cached_nodes = self.nodes
 
-        # 2) Edges
+        # 2) edges
         all_edges = list(self.edges(data=True))
         self._cached_unw = [(u, v) for u, v, attr in all_edges
                             if "log_weight" not in attr]
-        self._cached_w   = [(u, v, attr["log_weight"]) for u, v, attr in all_edges
-                            if "log_weight" in attr]
+        self._cached_w = [(u, v, attr["log_weight"]) for u, v, attr in all_edges
+                          if "log_weight" in attr]
 
-        # 3) Build successor map & in-degree
-        succ = {n: [] for n in self._cached_nodes}
-        in_deg = {n: 0 for n in self._cached_nodes}
-        for u, v in self._cached_unw + [(u, v) for (u, v, _) in self._cached_w]:
-            succ[u].append(v)
-            in_deg[v] += 1
-
-        # 4) Single Kahn run
-        queue = deque(n for n, d in in_deg.items() if d == 0)
-        topo = []
-        while queue:
-            n = queue.popleft()
-            topo.append(n)
-            for m in succ[n]:
-                in_deg[m] -= 1
-                if in_deg[m] == 0:
-                    queue.append(m)
-
+        # 3 & 4) topo order with a single rustworkx call
+        topo = list(self.topological_sort())
         self._cached_topo = topo
-        self._cached_rev  = list(reversed(topo))
-
+        self._cached_rev = list(reversed(topo))
     def _invalidate_cache(self):
         """Call this before any structure-changing operation."""
         for k in ["_cached_nodes", "_cached_unw", "_cached_w", "_cached_topo", "_cached_rev"]:
@@ -816,23 +1295,23 @@ class ProbabilisticCircuit(ProbabilisticModel, nx.DiGraph, SubclassJSONSerialize
         return {variable: index for index, variable in enumerate(self.variables)}
 
     @property
-    def layers(self) -> List[List[Unit]]:
-        return list(nx.bfs_layers(self, self.root))
+    def layers(self):
+        # replaces nx.bfs_layers
+        return [list(layer) for layer in self.bfs_layers(self.root)]
+
+    # descendants / connectivity helpers rewritten to use adapter API
+    def remove_unreachable_nodes(self, root):
+        reachable = self.descendants(root)
+        unreachable = set(self.nodes) - (reachable | {root})
+        self.remove_nodes_from(unreachable)
+
+    def is_valid(self):
+        return (self.is_directed_acyclic_graph()
+                and self.is_weakly_connected())
 
     @property
     def leaves(self) -> List[LeafUnit]:
         return self.root.leaves
-
-    def is_valid(self) -> bool:
-        """
-        Check if this graph is:
-
-        - acyclic
-        - connected
-
-        :return: True if the graph is valid, False otherwise.
-        """
-        return nx.is_directed_acyclic_graph(self) and nx.is_weakly_connected(self)
 
     def add_node(self, node: Unit, **attr):
         self._invalidate_cache()
@@ -901,14 +1380,6 @@ class ProbabilisticCircuit(ProbabilisticModel, nx.DiGraph, SubclassJSONSerialize
                 raise IntractableError("The circuit is not deterministic.")
         [unit.log_mode() for layer in reversed(self.layers) for unit in layer]
         return self.root.result_of_current_query
-
-    def remove_unreachable_nodes(self, root: Unit):
-        """
-        Remove all nodes that are not reachable from the root.
-        """
-        reachable_nodes = nx.descendants(self, root)
-        unreachable_nodes = set(self.nodes) - (reachable_nodes | {root})
-        self.remove_nodes_from(unreachable_nodes)
 
     def log_conditional_of_simple_event_in_place(self, simple_event: SimpleEvent) -> Tuple[Optional[Self], float]:
         """
@@ -1203,33 +1674,24 @@ class ProbabilisticCircuit(ProbabilisticModel, nx.DiGraph, SubclassJSONSerialize
     @property
     def log_weighted_edges(self):
         """
-        :return: All log-weighted edges of the circuit.
+        :return: list of (u, v, log_weight) triples for all weighted edges
         """
-        weighted_edges = []
-
-        for edge in self.edges:
-            edge_ = self.edges[edge]
-
-            if "log_weight" in edge_.keys():
-                weight = edge_["log_weight"]
-                weighted_edges.append((*edge, weight))
-
-        return weighted_edges
+        return [
+            (u, v, attr["log_weight"])
+            for u, v, attr in self.edges(data=True)
+            if "log_weight" in attr
+        ]
 
     @property
     def unweighted_edges(self):
         """
-        :return: All unweighted edges of the circuit.
+        :return: list of (u, v) pairs for edges that have NO 'log_weight'
         """
-        unweighted_edges = []
-
-        for edge in self.edges:
-            edge_ = self.edges[edge]
-
-            if "weight" not in edge_.keys():
-                unweighted_edges.append(edge)
-
-        return unweighted_edges
+        return [
+            (u, v)
+            for u, v, attr in self.edges(data=True)
+            if "log_weight" not in attr
+        ]
 
     def is_deterministic(self) -> bool:
         """
@@ -1303,20 +1765,39 @@ class ProbabilisticCircuit(ProbabilisticModel, nx.DiGraph, SubclassJSONSerialize
         :param inference_representation: The representation of the inference results as a function from node to string.
         :param inference_result_offset: The vertical offset of the inference results.
         """
-
-        # fill the colors for the nodes
+        # ---------------------------------------------------------------- #
+        # 1) get colours (unchanged)                                       #
+        # ---------------------------------------------------------------- #
         node_colors = self.fill_node_colors(node_colors)
 
-        # get the positions of the nodes
-        positions = networkx.drawing.bfs_layout(self, self.root)
-        position_for_variable_name = {node: (x + variable_name_offset, y) for node, (x, y) in positions.items()}
+        # ---------------------------------------------------------------- #
+        # 2) POSITION nodes                                                #
+        #    • try NetworkX’s bfs_layout for nice spacing                  #
+        #    • if it bails out (disconnected view), build a cheap layer-   #
+        #      based layout that always covers every node                  #
+        # ---------------------------------------------------------------- #
+        try:
+            positions = nx.drawing.bfs_layout(self, self.root)
+            if len(positions) != len(self.nodes):  # safety belt
+                raise nx.NetworkXError
+        except nx.NetworkXError:
+            # fallback: x = layer index, y = row number inside layer (downwards)
+            positions = {}
+            for x, layer in enumerate(self.layers):
+                for y, node in enumerate(reversed(layer)):  # reverse = top-down look
+                    positions[node] = (x, -y)
 
+        position_for_variable_name = {
+            node: (x + variable_name_offset, y) for node, (x, y) in positions.items()
+        }
 
-
-        # draw the edges
-        alpha_for_edges = [np.exp(self.get_edge_data(*edge)["log_weight"]) if self.get_edge_data(*edge) else 1. for edge in
-                           self.edges]
-
+        # ---------------------------------------------------------------- #
+        # 3) draw edges  …  (EVERYTHING BELOW IS UNCHANGED)                #
+        # ---------------------------------------------------------------- #
+        alpha_for_edges = [
+            np.exp(self.get_edge_data(*edge).get("log_weight", 0.0))
+            for edge in self.edges
+        ]
         nx.draw_networkx_edges(self, positions, alpha=alpha_for_edges, node_size=node_size)
         edge_labels = {(s, t): round(np.exp(w), 2) for (s, t, w) in self.log_weighted_edges}
         nx.draw_networkx_edge_labels(self, positions, edge_labels, label_pos=0.25)
